@@ -1,0 +1,10 @@
+{
+  "C_Cpp.intelliSenseEngine": "Default",
+  "C_Cpp.default.configurationProvider": "platformio.platformio-ide",
+  "files.associations": {
+    "*.ipp": "cpp",
+    "*.tcc": "cpp"
+  }
+}
+
+
