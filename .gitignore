@@ -11,3 +11,5 @@ data/private*
 .DS_Store
 *.pyc
 
+
+lib/credentials.h
