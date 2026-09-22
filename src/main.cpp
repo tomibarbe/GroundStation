@@ -14,9 +14,12 @@
 #include <LittleFS.h>
 
 #include "credentials.h"
+#if defined(ESP32)
+#include "downlink_gateway.h"
+#endif
 
-// Increase MQTT buffer size for larger JSON messages
-#define MQTT_MAX_PACKET_SIZE 512
+// Large enough for a 12-vertex PADDOCK JSON envelope.
+constexpr uint16_t DOWNLINK_MQTT_BUFFER_SIZE = 1024;
 
 // Keep cert content alive (TLS client keeps pointers)
 static String g_ca, g_crt, g_key;
@@ -34,6 +37,9 @@ PubSubClient mqtt(net);
 unsigned long lastHeartbeat = 0;
 unsigned long lastEmuTx = 0;
 uint32_t emuSeq = 0;
+static unsigned long lastWifiAttempt = 0;
+static unsigned long lastMqttAttempt = 0;
+static bool cloudConfigured = false;
 
 // Simple LRU cache for duplicate detection
 struct DupEntry {
@@ -54,38 +60,31 @@ bool loadFileToString(const char* path, String& out) {
 }
 
 void connectWiFi() {
-  DEBUG_PRINTLN("[WiFi] Connecting...");
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (lastWifiAttempt && millis() - lastWifiAttempt < 10000) return;
+  lastWifiAttempt = millis();
+  DEBUG_PRINTLN("[WiFi] Connecting in background...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT) {
-    delay(250);
-    DEBUG_PRINT(".");
-  }
-  DEBUG_PRINTLN("");
-
-  if (WiFi.status() != WL_CONNECTED) {
-    DEBUG_PRINTLN("[WiFi] Failed, rebooting in 5s");
-    delay(5000);
-    ESP.restart();
-  }
-  DEBUG_PRINTF("[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
 void connectMQTT() {
-  mqtt.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
-  mqtt.setBufferSize(MQTT_MAX_PACKET_SIZE); // Set larger buffer for JSON messages
-
+  if (!cloudConfigured || WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
+  if (lastMqttAttempt && millis() - lastMqttAttempt < MQTT_RECONNECT_DELAY) return;
+  if (time(nullptr) < 1609459200) return; // TLS and expiry require a valid clock
+  lastMqttAttempt = millis();
+#if defined(ESP8266)
+  net.setX509Time(time(nullptr));
+#endif
   DEBUG_PRINTLN("[MQTT] Connecting to AWS IoT...");
-  while (!mqtt.connected()) {
-    if (mqtt.connect(AWS_IOT_CLIENT_ID)) {
-      DEBUG_PRINTLN("[MQTT] Connected.");
-      DEBUG_PRINTF("[MQTT] Buffer size: %d bytes\n", mqtt.getBufferSize());
-    } else {
-      DEBUG_PRINTF("[MQTT] Failed rc=%d. Retrying in %d ms\n", mqtt.state(), MQTT_RECONNECT_DELAY);
-      delay(MQTT_RECONNECT_DELAY);
-    }
+  if (mqtt.connect(AWS_IOT_CLIENT_ID)) {
+    DEBUG_PRINTLN("[MQTT] Connected.");
+#if defined(ESP32)
+    bool sub = mqtt.subscribe("geoparcela/downlink/+", 1);
+    DEBUG_PRINTF("[DL] MQTT subscribe: %s\n", sub ? "OK" : "FAILED");
+#endif
+  } else {
+    DEBUG_PRINTF("[MQTT] Failed rc=%d; radio stays online\n", mqtt.state());
   }
 }
 
@@ -260,6 +259,7 @@ void setupLoRa() {
   LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
   LoRa.setCodingRate4(LORA_CODING_RATE);
   LoRa.setSyncWord(LORA_SYNC_WORD);
+  LoRa.enableCrc();
   DEBUG_PRINTLN("[LoRa] Ready.");
 #else
   DEBUG_PRINTLN("[LoRa] Skipped (SKIP_LORA=1)");
@@ -273,22 +273,23 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   DEBUG_PRINTLN("\n[Boot] Groundstation starting…");
 
-  // FS for certs
+  setupLoRa(); // Radio must be ready even when cloud/WiFi is unavailable.
+
+  // FS for certs and durable downlink queue. Never autoformat queued commands.
   if (!LittleFS.begin()) {
-    DEBUG_PRINTLN("[FS] LittleFS mount failed. Reformatting...");
-    LittleFS.format();
-    if (!LittleFS.begin()) {
-      DEBUG_PRINTLN("[FS] Mount failed after format.");
-      while (true) { delay(1000); }
-    }
+    DEBUG_PRINTLN("[FS] Mount failed; cloud/downlink disabled, radio still receiving");
+    return;
   }
+#if defined(ESP32)
+  GatewayDownlink::load();
+#endif
 
   // Load certs
   if (!loadFileToString(AWS_CERT_CA, g_ca) ||
       !loadFileToString(AWS_CERT_CRT, g_crt) ||
       !loadFileToString(AWS_CERT_PRIVATE, g_key)) {
     DEBUG_PRINTLN("[FS] Failed to read certs from /data. Did you upload with `pio run -t uploadfs`?");
-    while (true) { delay(1000); }
+    return;
   }
 
 #if defined(ESP8266)
@@ -303,27 +304,23 @@ void setup() {
   net.setPrivateKey(g_key.c_str());
 #endif
 
+  mqtt.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+  mqtt.setBufferSize(DOWNLINK_MQTT_BUFFER_SIZE);
+#if defined(ESP32)
+  mqtt.setCallback([](char* topic, byte* payload, unsigned int len) {
+    bool ok = GatewayDownlink::ingest(topic, payload, len);
+    DEBUG_PRINTF("[DL] MQTT %s\n", ok ? "accepted" : "rejected");
+  });
+#endif
+  cloudConfigured = true;
   connectWiFi();
-  syncTime();
-  connectMQTT();
-  setupLoRa();
-  sendStatus("online");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   DEBUG_PRINTLN("[Boot] Done.");
   digitalWrite(STATUS_LED_PIN, HIGH);
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-  if (!mqtt.connected()) connectMQTT();
-  mqtt.loop();
-
-  // Heartbeat
-  if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL) {
-    sendStatus("alive");
-    lastHeartbeat = millis();
-  }
-
 #if !SKIP_LORA
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
@@ -331,8 +328,30 @@ void loop() {
     while (LoRa.available()) payload += (char)LoRa.read();
     int rssi = LoRa.packetRssi();
     float snr = LoRa.packetSnr();
+    // Reply while the collar is still awake. Cloud publishing can wait.
+#if defined(ESP32)
+    ParsedPacket parsed = parseCSV(payload);
+    if (parsed.valid && parsed.msg_type == "POS")
+      GatewayDownlink::replyToCheckin(parsed.dev_id.c_str());
+#endif
     handleLoRaPacket(payload, rssi, snr);
   }
+#endif
+
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (!mqtt.connected()) connectMQTT();
+  if (mqtt.connected()) {
+    mqtt.loop();
+#if defined(ESP32)
+    GatewayDownlink::publishAcks(mqtt, DEVICE_ID);
+#endif
+    if (millis() - lastHeartbeat > HEARTBEAT_INTERVAL) {
+      sendStatus("alive");
+      lastHeartbeat = millis();
+    }
+  }
+#if defined(ESP32)
+  GatewayDownlink::pruneExpired();
 #endif
 
 #if EMU_COLLARS

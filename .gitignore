@@ -4,6 +4,7 @@
 .vscode/launch.json
 .vscode/ipch
 include/credentials.h
+include/lora_downlink_keys.h
 data/*.pem
 data/*-cert*
 data/*-key*
