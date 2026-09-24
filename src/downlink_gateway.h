@@ -148,6 +148,16 @@ inline bool buildFrame(JsonObjectConst root, const char* id, const uint8_t* key,
         ((active == 0) != (version == 0))) return false;
     f.type = FENCE; f.body_len = 4;
     write16(f.body, active); write16(f.body + 2, version);
+  } else if (!strcmp(kind, "SHIFT")) {
+    uint32_t source, sourceVersion, target, targetVersion;
+    if (!number(p["source_paddock_id"], 65535, source) || !source ||
+        !number(p["source_version"], 65535, sourceVersion) || !sourceVersion ||
+        !number(p["target_paddock_id"], 65535, target) || !target ||
+        !number(p["target_version"], 65535, targetVersion) || !targetVersion ||
+        (source == target && sourceVersion == targetVersion)) return false;
+    f.type = SHIFT; f.body_len = 8;
+    write16(f.body, source); write16(f.body + 2, sourceVersion);
+    write16(f.body + 4, target); write16(f.body + 6, targetVersion);
   } else if (!strcmp(kind, "PADDOCK")) {
     uint32_t paddock, version, border, shock, grace, n;
     if (!number(p["paddock_id"], 65535, paddock) || !paddock ||
